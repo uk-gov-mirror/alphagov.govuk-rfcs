@@ -69,9 +69,8 @@ probably fine.  The problem is elsewhere.
 Two of these indicate capacity problems outside of the instance, and
 the third is an alert that a manual maintenance procedure needs to be
 performed some time in the next two months.  They all share the
-property that if one instance reports a failure, all will.  And so if
-we use these healthchecks as part of load balancing rules, all running
-instances of the app will be taken down simultaneously.
+property that if one instance reports a failure, all will.  This makes
+them unsuitable for load balancing purposes.
 
 Even if we don't make our healthchecks suitable for load balancing, as
 GOV.UK moves towards continuous deployments, we will end up in
