@@ -82,17 +82,36 @@ completely broken.  That's all.
 
 ## Proposal
 
-My proposal comes down to three parts:
+I propose that we adopt this definition of a healthcheck:
 
-1. Remove the "warning" state of `GovukHealthcheck`, so a healthcheck
-   result is either "ok" or "critical".
-2. Make `GovukHealthcheck` serve an HTTP status of 500 for a
-   "critical" result.
-3. Add a separate healthcheck for liveness, to use with the ECS
-   container lifecycle.
+> A healthcheck is an HTTP endpoint which MUST return an HTTP status
+> of either 200 (if the instance may receive requests) or 500 (if it
+> should not).  The healthcheck MAY also return details in the
+> response body as a JSON object.
 
-But we can't make this change right now, we have a migration path to
-follow first.
+This is more suitable for our three purposes than before:
+
+- For load balancing, an unhealthy app will be taken out of the pool.
+- For continuous deployments, we can check the HTTP status rather than
+  read the response body.
+- For alerting, we can continue to read the response body.
+
+Adopting this definition gives us some migration work to do.  We can't
+start serving non-"ok" healthchecks with an HTTP status of 500 right
+now, as some of our healthchecks are unsuitable for load balancing.
+
+We will need to implement the proposal in stages:
+
+1. List all the healthchecks which need changing, because they don't
+   indicate a critical failure of the app (done, see the appendix)
+2. For each such healthcheck:
+   - remove it if it's not adding value, or
+   - add a separate alert if it is.
+3. Once all healthchecks are updated, change `GovukHealthcheck` to
+   serve the appropriate HTTP status code.
+
+As part of (2), we will remove the "warning" state some of our
+healthchecks return.
 
 ### Remove the "warning" state
 
@@ -120,49 +139,22 @@ the specific condition we need to know about?
 By removing the "warning" state, we will remove some spurious alerts
 which don't add value, and add more specific alerts for ones which do.
 
+### Revise the healthchecks
+
+Some of the checks can probably just be removed, others can be
+implemented as Icinga checks by drawing on data we already report to
+graphite, but some will need new metrics to be made available first.
+
+[Prometheus][], which we are adopting in the replatforming work, is a
+pull-based metrics gathering tool, which nicely solves the problem of
+how to get application state into an alert.  But we're not
+replatformed yet, so until then we may need to do something like
+email-alert-api, which [has a worker to push metrics to graphite][].
+
 ### Make `GovukHealthcheck` return a 500 status for critical failure
 
-This is a requirement for `GovukHealthcheck` to be usable with load
-balancers.
-
-### Have separate healthchecks for liveness and readiness
-
-If `GovukHealthcheck` checks whether an instance is ready to handle
-requests, and takes it out of the load balancer target group if not,
-then it is a *readiness* check.
-
-There is also value in having a separate *liveness* check, which
-simply checks if the instance is running and reachable, and doesn't
-check any of its dependencies:
-
-```ruby
-get "/healthcheck", to: proc { [200, {}, []] }
-get "/healthcheck/ready", to: GovukHealthcheck.rack_response(...)
-```
-
-When we have replatformed to ECS, this healthcheck can be used to
-determine if a container needs to be automatically restarted, for
-example if the process has crashed.
-
-In a sense we already have both liveness and readiness healthchecks:
-the liveness part comes from `GovukHealthcheck` always returning an
-HTTP status of 200, and the readiness part comes from reading the JSON
-response body.  But our load balancers cannot read the response body,
-so in practice we can't make use of our readiness check.
-
-### Migration path
-
-We can't start serving non-"ok" healthchecks with an HTTP status of
-500 right now, as this will take down entire apps due to unsuitable
-healthchecks.  We will need to do this in stages:
-
-1. List all the healthchecks which need changing, because they don't
-   indicate a critical failure of the app (done, see the appendix)
-2. For each such healthcheck:
-   - remove it if it's not adding value, or
-   - add a separate alert if it is.
-3. Once all healthchecks are updated, change `GovukHealthcheck` to
-   serve the appropriate HTTP status code.
+Implementing this may also require changes to our Icinga configuration
+in puppet.
 
 ## Appendix: Healthchecks which need changing
 
@@ -191,6 +183,51 @@ Notes:
 - [finder-frontend][] has a `/healthcheck` and a `/healthcheck.json` which do different things.
 - Various apps don't have any healthcheck endpoint at all.
 - Various apps have a healthcheck endpoint which is just `proc { [200, {}, []] }`.
+
+## Appendix: Healthchecks in ECS
+
+[Amazon ECS][], which we are migrating to from EC2, [supports
+healthchecks][].  ECS uses healthchecks to restart crashed instances.
+This is a related, but different, use-case to load balancing.
+
+Healthchecks fall into two types:
+
+- *Liveness:* is the instance running at all?
+- *Readiness:* is the instance ready to handle requests?
+
+Our healthchecks are readiness healthchecks.  Readiness healthchecks
+are good for load balancing, but not for detecting if an instance
+needs to be restarted.
+
+For example, let's say we have an application which uses a database,
+and that due to some transient fault (like a network partition) some
+of the instances cannot reach the database.  We do not want to send
+traffic to those instances, so their healthchecks should fail.  But
+restarting the instances won't resolve the problem, as it's an issue
+with the underlying infrastructure, so we don't want ECS to
+automatically terminate the instances.  We want the instances to keep
+running, so that when the transient fault recovers, they can quickly
+begin serving traffic again.
+
+On the other hand, let's say an instance gets stuck in some loop, and
+can't handle any inbound requests at all.  The healthcheck will fail,
+due to timing out, and so it will be taken out of the load balancing
+pool.  In this case we *do* want ECS to restart the instance, as it's
+unlikely to recover by itself.
+
+ECS healthchecks can be arbitrary commands, so we can derive a
+liveness healthcheck from the readiness one:
+
+```
+[ "CMD-SHELL", "curl http://localhost/healthcheck" ]
+```
+
+The default behaviour of `curl` is to return an exit status of 0
+(success) if it gets any response (even one with an error status
+code), and return an exit status of 1 (failure) for network issues
+(like timeouts).  So this is a healthcheck which will mark an instance
+as unhealthy *if and only if* it is totally unreachable.  Which is
+what we want.
 
 [`GovukHealthcheck`]: https://github.com/alphagov/govuk_app_config/blob/b5f76dd7920ccee294c6e862336265980c9eb323/lib/govuk_app_config/govuk_healthcheck.rb
 [`GovukHealthcheck::ActiveRecord`]: https://github.com/alphagov/govuk_app_config/blob/b5f76dd7920ccee294c6e862336265980c9eb323/lib/govuk_app_config/govuk_healthcheck/active_record.rb
@@ -222,3 +259,7 @@ Notes:
 [signon]: https://github.com/alphagov/signon
 
 [an equivalent implementation]: https://github.com/alphagov/asset-manager/blob/e8b25f21a72948117c7dcb084491af26b949805a/app/controllers/healthcheck_controller.rb
+[Prometheus]: https://prometheus.io/
+[has a worker to push metrics to graphite]: https://github.com/alphagov/email-alert-api/blob/master/app/workers/metrics_collection_worker.rb
+[Amazon ECS]: https://aws.amazon.com/ecs/
+[supports healthchecks]: https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_HealthCheck.html
