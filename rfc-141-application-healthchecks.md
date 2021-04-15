@@ -136,7 +136,7 @@ healthchecks return.
 Separate liveness and readiness healthchecks are a common best
 practice.  They are separate because they serve different purposes:
 
-- Liveness is used by the application runtime (such as [AWS ECS][],
+- Liveness is used by the application runtime (such as [Amazon ECS][],
   which we are replatforming to) to determine if an instance has
   crashed or entered some other unrecoverable state, and must be
   restarted.
